@@ -2197,6 +2197,8 @@ export default class SummaryDetailPage extends Component<SummaryDetailPageProps,
      * - 仅发起人（creator）发送，避免每个查看者都发一遍；
      * - 按 completion run（result_id，旧接口回退 updated_at）+ source 去重：同一完成
      *   只发一次，而同一 task 重新生成产生新 run 后仍会再次发送；
+     * - 跨 tab 用 per-completion 单锁（Web Locks）把「整条 completion 的 检查-发送-落标记」
+     *   串行化，避免多 tab 分持 per-source 锁时 marker RMW 丢更新（P2-3）；
      * - 同一实例内用 summaryNotifyInFlight 防止同一次完成的两条触发路径并发重复发送；
      * - 已解散的群跳过（沿用 isConversationDisbanded 这条既有发送不变量）；
      * - 发送走 chatManager.send，与 handleForwardToChat 一致；群频道无需注入 space_id。
@@ -2218,34 +2220,41 @@ export default class SummaryDetailPage extends Component<SummaryDetailPageProps,
         if (groupSourceIds.length === 0) return;
         const completionKey = summaryNotifyCompletionKey(detail);
 
-        for (const sourceId of groupSourceIds) {
-            const inFlightKey = `${completionKey || detail.task_id}:${sourceId}`;
-            if (completionKey && hasSentSummaryNotify(completionKey, sourceId)) continue;
-            if (this.summaryNotifyInFlight.has(inFlightKey)) continue; // 本实例正在发
-            const ch = new Channel(sourceId, ChannelTypeGroup);
+        // 早退：本轮所有群源都已发过就不必进锁（reopen 等场景）。
+        if (completionKey && groupSourceIds.every((id) => hasSentSummaryNotify(completionKey, id))) return;
 
-            this.summaryNotifyInFlight.add(inFlightKey);
-            try {
-                await withSummaryNotifyLock(inFlightKey, async () => {
-                    // 进入跨 tab 锁后必须重读 marker；等待锁期间另一 tab 可能已发送成功。
-                    if (completionKey && hasSentSummaryNotify(completionKey, sourceId)) return;
-                    // 已解散群不发（保持与既有发送路径一致的只读不变量）。
-                    if (isConversationDisbanded(ch)) return;
-                    try {
-                        const msg = new SummaryNotifyContent();
-                        msg.fromUID = myUid;
-                        msg.fromName = WKApp.loginInfo.selfDisplayName();
-                        await WKSDK.shared().chatManager.send(msg, ch);
-                        if (completionKey) markSummaryNotifySent(completionKey, sourceId);
-                    } catch (error) {
-                        // AC4：单群失败不影响其余群，但必须保留 channel + error 的可观测性。
-                        console.warn("Failed to send group summary notification", ch, error);
-                    }
-                });
-            } finally {
-                this.summaryNotifyInFlight.delete(inFlightKey);
+        // P2-3：整条 completion 用一把锁（per-completion），不再 per-source。marker 落在
+        // 单一 runs key 上做 RMW，若两 tab 分别持 per-source 锁处理 group-a / group-b，
+        // 它们的 RMW 不串行 → 后写覆盖先写 → 某 source 的 marker 丢失、下轮重发。改用
+        // per-completion 单锁把「整条 completion 的 检查-发送-落标记」串行化，跨 tab 收敛。
+        // 无 Web Locks 时 withSummaryNotifyLock 退化为直接执行，靠 summaryNotifyInFlight
+        // 兜住同实例并发；跨 tab 的降级窗口与原实现一致（本次不改降级路径）。
+        const lockKey = `completion:${completionKey ?? `task:${detail.task_id}`}`;
+        await withSummaryNotifyLock(lockKey, async () => {
+            for (const sourceId of groupSourceIds) {
+                const inFlightKey = `${completionKey || detail.task_id}:${sourceId}`;
+                // 进锁后重读 marker：等待锁期间另一 tab 可能已把本 source 发完。
+                if (completionKey && hasSentSummaryNotify(completionKey, sourceId)) continue;
+                if (this.summaryNotifyInFlight.has(inFlightKey)) continue; // 本实例正在发
+                const ch = new Channel(sourceId, ChannelTypeGroup);
+                // 已解散群不发（保持与既有发送路径一致的只读不变量）。
+                if (isConversationDisbanded(ch)) continue;
+
+                this.summaryNotifyInFlight.add(inFlightKey);
+                try {
+                    const msg = new SummaryNotifyContent();
+                    msg.fromUID = myUid;
+                    msg.fromName = WKApp.loginInfo.selfDisplayName();
+                    await WKSDK.shared().chatManager.send(msg, ch);
+                    if (completionKey) markSummaryNotifySent(completionKey, sourceId);
+                } catch (error) {
+                    // AC4：单群失败不影响其余群，但必须保留 channel + error 的可观测性。
+                    console.warn("Failed to send group summary notification", ch, error);
+                } finally {
+                    this.summaryNotifyInFlight.delete(inFlightKey);
+                }
             }
-        }
+        });
     }
 
     /**

@@ -85,6 +85,7 @@ vi.mock('../../components/SummaryEditor', () => ({ default: () => null }));
 
 import SummaryDetailPage from '../SummaryDetailPage';
 import { SummaryMode, TaskStatus, SourceType } from '../../types/summary';
+import { hasSentSummaryNotify } from '../../utils/summaryHelpers';
 
 // creator = "test-uid"（见 __mocks__/dmworkBase.ts 的 WKApp.loginInfo.uid）
 const ME = 'test-uid';
@@ -280,5 +281,72 @@ describe('SummaryDetailPage.sendGroupSummaryNotify (octo-web#289)', () => {
 
         expect(notify).toHaveBeenCalledOnce();
         expect(notify).toHaveBeenCalledWith(detail);
+    });
+});
+
+// P2-3（yujiawei @ PR #1234）：marker RMW 跨 tab race。
+// 修法 B：整条 completion 用一把 per-completion 锁,而非 per-source。两 tab 分持不同
+// per-source 锁时,markSummaryNotifySent 对单一 runs key 的 RMW 不串行 → 后写覆盖先写 →
+// 某 source marker 丢失、下轮重发。per-completion 单锁把整条 completion 串行化收敛。
+describe('SummaryDetailPage.sendGroupSummaryNotify cross-tab marker race (P2-3)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        localStorage.clear();
+        sendMock.mockResolvedValue(undefined);
+        disbandedMock.mockReturnValue(false);
+    });
+
+    function installLocks(request: (name: string, action: () => Promise<unknown>) => Promise<unknown>) {
+        Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } });
+    }
+    function clearLocks() {
+        Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined });
+    }
+
+    it('takes exactly one per-completion lock for all group sources (not per-source)', async () => {
+        const names: string[] = [];
+        const request = vi.fn((name: string, action: () => Promise<unknown>) => {
+            names.push(name);
+            return action();
+        });
+        installLocks(request);
+        try {
+            await newPage().sendGroupSummaryNotify(makeDetail()); // group-a + group-b
+            // 修复前每个 source 一把锁 → 2 个 per-source name；修复后整条 completion 一把锁。
+            expect(names).toEqual(['octo-summary-notify:completion:1:result:10']);
+            expect(sendMock).toHaveBeenCalledTimes(2);
+        } finally {
+            clearLocks();
+        }
+    });
+
+    it('does not lose a source marker when two tabs handle the same completion concurrently', async () => {
+        // 按 name 串行化的 Web Locks mock（真互斥），模拟两 tab 抢同一把 completion 锁。
+        const chains = new Map<string, Promise<unknown>>();
+        const request = vi.fn((name: string, action: () => Promise<unknown>) => {
+            const prev = chains.get(name) ?? Promise.resolve();
+            const run = prev.then(() => action(), () => action());
+            chains.set(name, run.then(() => undefined, () => undefined));
+            return run;
+        });
+        installLocks(request);
+        // 方法学：marker 读路径走 Storage.prototype.getItem —— 必须用 spyOn(Storage.prototype)，
+        // 直接 localStorage.getItem = fn 会被 jsdom 的 Storage Proxy 吞掉（存成叫 getItem 的 item）。
+        const getItemSpy = vi.spyOn(Storage.prototype, 'getItem');
+        try {
+            const detail = makeDetail(); // completionKey = 1:result:10, sources group-a/group-b
+            await Promise.all([
+                newPage().sendGroupSummaryNotify(detail),
+                newPage().sendGroupSummaryNotify(detail),
+            ]);
+            // 每个源跨两 tab 只发一次；两个 source marker 都保留 → 下一轮 completion 不会重发。
+            expect(sendMock.mock.calls.map((c) => c[1].channelID).sort()).toEqual(['group-a', 'group-b']);
+            expect(hasSentSummaryNotify('1:result:10', 'group-a')).toBe(true);
+            expect(hasSentSummaryNotify('1:result:10', 'group-b')).toBe(true);
+            expect(getItemSpy).toHaveBeenCalled();
+        } finally {
+            getItemSpy.mockRestore();
+            clearLocks();
+        }
     });
 });
